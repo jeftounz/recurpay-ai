@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { Receipt, RECEIPT_MAX_BYTE_SIZE_BYTES } from './Receipt.ts';
+import { Receipt, RECEIPT_MAX_BYTE_SIZE_BYTES, type ReceiptSnapshot, type ReceiptStatus } from './Receipt.ts';
 import { ReceiptField } from './ReceiptField.ts';
 import { ConfidenceScore } from '../value-objects/ConfidenceScore.ts';
 import { FIELD_KEYS, type FieldKey } from './FieldKey.ts';
@@ -168,4 +168,81 @@ test('toSnapshot es una copia de lectura, no expone las instancias mutables inte
   const snapshot = receipt.toSnapshot();
   assert.equal(snapshot.fields.length, FIELD_KEYS.length);
   assert.equal(snapshot.status, 'NEEDS_REVIEW');
+});
+
+// --- Rehidratación -----------------------------------------------------------
+
+const REVIEWER = createUserId('user-reviewer');
+const REVIEWED_AT = new Date('2026-09-10T14:30:00Z');
+
+/** Un comprobante llevado por transiciones reales a cada estado alcanzable. */
+function receiptIn(status: ReceiptStatus): Receipt {
+  const receipt = uploadReceipt();
+  if (status === 'UPLOADED') return receipt;
+  receipt.startExtraction();
+  if (status === 'EXTRACTING') return receipt;
+  if (status === 'FAILED') {
+    receipt.failExtraction('schema rechazado dos veces');
+    return receipt;
+  }
+  receipt.completeExtraction(fieldsAllAbove(THRESHOLD, { ISSUING_BANK: 0.4 }));
+  if (status === 'NEEDS_REVIEW') return receipt;
+  if (status === 'REJECTED') {
+    receipt.reject('comprobante ilegible');
+    return receipt;
+  }
+  receipt.correctField('ISSUING_BANK', 'Banco Mercantil', REVIEWER, REVIEWED_AT);
+  receipt.confirm(createPaymentId('payment-1'), REVIEWER, REVIEWED_AT);
+  return receipt;
+}
+
+const ALL_STATUSES: readonly ReceiptStatus[] = ['UPLOADED', 'EXTRACTING', 'NEEDS_REVIEW', 'CONFIRMED', 'REJECTED', 'FAILED'];
+
+test('rehydrate(toSnapshot()) es la identidad en todos los estados alcanzables', () => {
+  for (const status of ALL_STATUSES) {
+    const original = receiptIn(status);
+    assert.equal(original.currentStatus, status);
+    assert.deepEqual(Receipt.rehydrate(original.toSnapshot()).toSnapshot(), original.toSnapshot(), status);
+  }
+});
+
+test('un comprobante rehidratado sigue obedeciendo sus transiciones', () => {
+  const receipt = Receipt.rehydrate(receiptIn('NEEDS_REVIEW').toSnapshot());
+
+  const blocked = receipt.confirm(createPaymentId('payment-1'), REVIEWER, REVIEWED_AT);
+  assert.equal(blocked.isOk, false);
+  assert.equal(blocked.isOk ? null : blocked.error.code, 'PENDING_HUMAN_REVIEW');
+
+  receipt.correctField('ISSUING_BANK', 'Banco Mercantil', REVIEWER, REVIEWED_AT);
+  assert.equal(receipt.confirm(createPaymentId('payment-1'), REVIEWER, REVIEWED_AT).isOk, true);
+});
+
+test('rehydrate no comparte instantes con el snapshot de origen', () => {
+  const snapshot = receiptIn('CONFIRMED').toSnapshot();
+  const receipt = Receipt.rehydrate(snapshot);
+
+  snapshot.confirmedAt?.setUTCFullYear(1999);
+
+  assert.equal(receipt.toSnapshot().confirmedAt?.getUTCFullYear(), 2026);
+});
+
+test('rehydrate lanza ante snapshots que ninguna transición puede producir', () => {
+  const confirmed = receiptIn('CONFIRMED').toSnapshot();
+  const review = receiptIn('NEEDS_REVIEW').toSnapshot();
+  const uploaded = receiptIn('UPLOADED').toSnapshot();
+
+  const corrupt: ReadonlyArray<[string, ReceiptSnapshot]> = [
+    ['CONFIRMED sin pago', { ...confirmed, paymentId: null }],
+    ['confirmedBy fuera de CONFIRMED', { ...review, confirmedBy: REVIEWER }],
+    ['campos sin extracción completada', { ...uploaded, fields: review.fields }],
+    ['falta un campo', { ...review, fields: review.fields.slice(1) }],
+    ['confianza global que no es la mínima', { ...review, overallConfidence: 0.95 }],
+    ['FAILED sin motivo', { ...receiptIn('FAILED').toSnapshot(), rejectedReason: null }],
+    ['motivo fuera de FAILED/REJECTED', { ...review, rejectedReason: 'x' }],
+    ['storageKey que es una URL', { ...uploaded, storageKey: 'https://bucket/r1.png' }],
+    ['contentHash que no es sha256', { ...uploaded, contentHash: 'abc' }],
+  ];
+  for (const [label, snapshot] of corrupt) {
+    assert.throws(() => Receipt.rehydrate(snapshot), label);
+  }
 });

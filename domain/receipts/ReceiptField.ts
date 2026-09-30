@@ -3,6 +3,7 @@ import { domainError, type DomainError } from '../shared/DomainError.ts';
 import { err, ok, type Result } from '../shared/Result.ts';
 import type { FieldKey } from './FieldKey.ts';
 import type { UserId } from './ids.ts';
+import { copyInstant } from '../shared/copyInstant.ts';
 
 export interface ExtractedFieldParams {
   readonly key: FieldKey;
@@ -51,6 +52,14 @@ export class ReceiptField {
     confidence: ConfidenceScore,
     requiresReview: boolean,
   ) {
+    // Invariante compartida por los dos caminos de nacimiento (`extracted` y
+    // `rehydrate`): por eso vive en el constructor y no en cada factory.
+    if ((rawValue === null) !== (normalizedValue === null)) {
+      throw new Error(
+        `ReceiptField ${key}: rawValue y normalizedValue deben estar ambos presentes o ` +
+          'ambos ausentes — revisa el mapper de extracción o la fila de origen',
+      );
+    }
     this.key = key;
     this.rawValue = rawValue;
     this.normalizedValue = normalizedValue;
@@ -71,14 +80,6 @@ export class ReceiptField {
    * cumple, el error está en el mapper que llamó a este factory, no aquí.
    */
   static extracted(params: ExtractedFieldParams): ReceiptField {
-    const hasRaw = params.rawValue !== null;
-    const hasNormalized = params.normalizedValue !== null;
-    if (hasRaw !== hasNormalized) {
-      throw new Error(
-        `ReceiptField ${params.key}: rawValue y normalizedValue deben estar ambos presentes o ` +
-          'ambos ausentes — revisa el mapper de extracción, no debería llegar aquí sin normalizar',
-      );
-    }
     return new ReceiptField(
       params.key,
       params.rawValue,
@@ -86,6 +87,43 @@ export class ReceiptField {
       params.confidence,
       params.confidence.isBelow(params.threshold),
     );
+  }
+
+  /**
+   * Reconstruye un campo desde un snapshot persistido (una fila de
+   * `receipt_fields`). No pasa por `correct()` ni devuelve `Result`: no es
+   * una decisión de negocio sino la restauración de un estado que ya fue
+   * válido. Si el snapshot viola un invariante, la fila está corrupta o el
+   * mapper tiene un bug, y eso es una excepción.
+   *
+   * `requiresReview` se restaura tal cual, **no** se recalcula contra el
+   * umbral actual del tenant: es la foto del umbral vigente al extraer. Si el
+   * tenant sube el umbral mañana, los comprobantes ya revisados no vuelven a
+   * la cola.
+   */
+  static rehydrate(snapshot: ReceiptFieldSnapshot): ReceiptField {
+    const field = new ReceiptField(
+      snapshot.fieldKey,
+      snapshot.rawValue,
+      snapshot.normalizedValue,
+      ConfidenceScore.parse(snapshot.confidence),
+      snapshot.requiresReview,
+    );
+    if (snapshot.correction !== null) {
+      const value = snapshot.correction.value.trim();
+      if (value.length === 0) {
+        throw new Error(`ReceiptField ${snapshot.fieldKey}: una corrección persistida no puede estar vacía`);
+      }
+      field.correctedValue = value;
+      field.correctedBy = snapshot.correction.by;
+      field.correctedAt = copyInstant(snapshot.correction.at);
+    }
+    // `final_value` es una columna generada; si no coincide con lo que se
+    // deriva de los demás datos, el snapshot no salió de este agregado.
+    if (snapshot.finalValue !== field.finalValue()) {
+      throw new Error(`ReceiptField ${snapshot.fieldKey}: finalValue no coincide con corrección/normalizado`);
+    }
+    return field;
   }
 
   get fieldKey(): FieldKey {
@@ -136,7 +174,7 @@ export class ReceiptField {
   toSnapshot(): ReceiptFieldSnapshot {
     const correction =
       this.correctedValue !== null && this.correctedBy !== null && this.correctedAt !== null
-        ? { value: this.correctedValue, by: this.correctedBy, at: this.correctedAt }
+        ? { value: this.correctedValue, by: this.correctedBy, at: copyInstant(this.correctedAt) }
         : null;
     return {
       fieldKey: this.key,

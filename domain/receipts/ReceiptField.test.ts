@@ -100,3 +100,42 @@ test('toSnapshot expone el estado sin permitir mutarlo desde fuera', () => {
   assert.equal(snapshot.correction?.value, 'Banco Mercantil');
   assert.equal(snapshot.requiresReview, true);
 });
+
+// --- Rehidratación -----------------------------------------------------------
+
+test('rehydrate(toSnapshot()) reproduce el mismo campo, con su corrección', () => {
+  const field = lowConfidenceField();
+  field.correct('Banco Mercantil', createUserId('user-1'), new Date('2026-09-09T10:00:00Z'));
+
+  const rehydrated = ReceiptField.rehydrate(field.toSnapshot());
+
+  assert.deepEqual(rehydrated.toSnapshot(), field.toSnapshot());
+  assert.equal(rehydrated.needsHumanAttention(), false);
+});
+
+test('rehydrate conserva requiresReview de la extracción, no lo recalcula', () => {
+  // 0.99 hoy pasaría cualquier umbral razonable, pero el campo se marcó para
+  // revisión cuando se extrajo: esa foto es la que manda.
+  const snapshot = { ...highConfidenceField().toSnapshot(), confidence: 0.99, requiresReview: true };
+
+  assert.equal(ReceiptField.rehydrate(snapshot).needsHumanAttention(), true);
+});
+
+test('rehydrate lanza ante un snapshot incoherente', () => {
+  const valid = highConfidenceField().toSnapshot();
+  const correction = { value: '   ', by: createUserId('user-1'), at: new Date('2026-09-09T10:00:00Z') };
+
+  assert.throws(() => ReceiptField.rehydrate({ ...valid, finalValue: 'otro' }), /finalValue/);
+  assert.throws(() => ReceiptField.rehydrate({ ...valid, normalizedValue: null, finalValue: null }), /ambos/);
+  assert.throws(() => ReceiptField.rehydrate({ ...valid, correction, finalValue: '   ' }), /vacía/);
+  assert.throws(() => ReceiptField.rehydrate({ ...valid, confidence: 1.4 }), RangeError);
+});
+
+test('la fecha de corrección del snapshot no está ligada al campo', () => {
+  const field = lowConfidenceField();
+  field.correct('Banco Mercantil', createUserId('user-1'), new Date('2026-09-09T10:00:00Z'));
+
+  field.toSnapshot().correction?.at.setUTCFullYear(1999);
+
+  assert.equal(field.toSnapshot().correction?.at.getUTCFullYear(), 2026);
+});

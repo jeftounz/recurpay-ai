@@ -43,6 +43,62 @@ les afecta; `npm run build` lo confirma.
 | `npm run typecheck` | sin errores (dominio estricto + Next) |
 | `npm run build` | compila |
 
-**Nota:** `CLAUDE.md` e `INTEGRACION.md` dicen 128 tests. El recuento real por
-archivo (13 archivos de test) suma 144, y es estable entre zonas horarias. Los
-documentos parecen desactualizados; pendiente de confirmar.
+**Nota:** los documentos decían 128 tests. Confirmado que 144 es lo correcto:
+el 128 salía de un entorno sin zod, donde se excluyeron `extraction-schema.test.ts`
+(10) y `ReceiptExtractionMapper.test.ts` (6).
+
+## Punto 1 — Rehidratación de agregados
+
+### Qué se hizo
+
+| Archivo | Cambio |
+|---|---|
+| `domain/receipts/ReceiptField.ts` | `ReceiptField.rehydrate(snapshot)`. La invariante raw/normalized pasa del factory `extracted()` al constructor, para que la cumplan los dos caminos de nacimiento. |
+| `domain/receipts/Receipt.ts` | `Receipt.rehydrate(snapshot)`. `validateFieldSet()` y `lowestConfidence()` se extraen de `completeExtraction()` y ahora los comparten la transición y la rehidratación. |
+| `domain/shared/copyInstant.ts` | Copia defensiva de `Date`, usada por `toSnapshot()` y `rehydrate()`. |
+| `infrastructure/receipts/InMemoryReceiptRepository.ts` | Guarda `ReceiptSnapshot` y rehidrata una instancia nueva en cada lectura. |
+| `infrastructure/receipts/InMemoryReceiptRepository.test.ts` | Nuevo. |
+
+### Decisiones
+
+1. **`rehydrate` lanza, no devuelve `Result`.** Restaura un estado que ya fue
+   válido; no toma una decisión de negocio. Un snapshot que viola un invariante
+   indica corrupción o un bug del mapper: es el mismo caso que un value object
+   con un valor imposible.
+2. **No reproduce transiciones.** Las transiciones validan reglas del momento
+   en que ocurrieron (el umbral de entonces, el actor de entonces). Lo que sí se
+   valida son los invariantes de estado, espejo de los `CHECK` de `receipts`:
+   - campos completos sólo en `NEEDS_REVIEW` / `CONFIRMED` / `REJECTED`;
+   - `overallConfidence` igual a la mínima de los campos;
+   - `rejectedReason` sólo en `FAILED` / `REJECTED`, y obligatorio ahí;
+   - `paymentId`, `confirmedBy` y `confirmedAt` juntos, y sólo en `CONFIRMED`;
+   - `storageKey` y `contentHash` se vuelven a parsear con sus value objects.
+3. **`requiresReview` no se recalcula.** Es la foto del umbral vigente al
+   extraer. Si el tenant cambia el umbral, los comprobantes ya revisados no
+   vuelven a la cola.
+4. **`finalValue` se verifica, no se restaura.** En la base es una columna
+   generada; si no coincide con lo que se deriva, la fila no salió de este
+   agregado.
+5. **Copia defensiva de `Date`.** `toSnapshot()` devolvía la misma instancia
+   de `confirmedAt` y de `correction.at`, y `Date` es mutable: mutar el snapshot
+   cambiaba el agregado. Sin esto, guardar snapshots en el repositorio no
+   habría aislado nada.
+
+### Nota para el repositorio de Postgres
+
+`receipt_fields` es único por `(extraction_run_id, field_key)`, no por
+comprobante. Al construir el snapshot, el mapper debe tomar sólo los campos del
+run `SUCCEEDED`. Hoy sólo puede haber uno, porque los runs rechazados no
+producen campos, pero la consulta tiene que decirlo explícitamente.
+
+### Verificación
+
+| Comando | Resultado |
+|---|---|
+| `npm run test:domain` | 156 / 156 (144 + 12 nuevos) |
+| Con `TZ=Pacific/Kiritimati` y `TZ=Pacific/Midway` | 156 / 156 |
+| `npm run typecheck` | sin errores |
+
+Comprobación del test del repositorio: contra la implementación original, que
+guardaba la instancia viva, fallan los dos tests de aislamiento; contra la
+nueva, pasan.
